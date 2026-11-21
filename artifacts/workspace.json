@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid31485",
+  "B": "/home/dev/feedback/uid31485",
+  "sha": "fd39199ec85da60e55ba6abec29184a8eda2bb05",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "CiscoCXSecurity",
+    "repo": "enum4linux",
+    "sha": "fd39199ec85da60e55ba6abec29184a8eda2bb05"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "enum4linux",
+    "cloneUrl": "https://github.com/Rrr119/enum4linux.git"
+  },
+  "at": "2026-11-21T08:39:46.023Z"
+}

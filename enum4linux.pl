@@ -43,15 +43,29 @@
 use strict;
 use warnings;
 use Getopt::Std;
+use Getopt::Long qw(GetOptionsFromArray);
 use File::Basename;
 use Data::Dumper;
 use Scalar::Util qw(tainted);
 use Term::ANSIColor;
+use POSIX qw(WNOHANG WIFEXITED WEXITSTATUS WIFSIGNALED);
+use Time::HiRes ();
+use File::Temp ();
 
 my $VERSION="0.9.1";
 my $verbose = 0;
 my $debug = 0;
 my $aggressive = 0;
+my $global_concurrency = 32;
+my $global_rate = 8.0;
+my $global_retries = 2;
+my $global_retry_delay = 1.0;
+my $global_host_timeout = 30.0;
+my $global_time_budget = 600.0;
+my $global_time_budget_explicit = 0;
+my $global_max_hosts = 65536;
+my $global_targets_option = '';
+my $global_target_file = '';
 my $global_fail_limit = 1000;     # no command line option yet
 my $global_search_until_fail = 0; # no command line option yet
 my $heighest_rid = 999999;
@@ -63,6 +77,7 @@ my $global_filename = '';
 my $global_share_file = '';
 my $global_detailed = 0;
 my $global_passpol = 0;
+my $global_target = '';
 my $global_rid_range = "500-550,1000-1050";
 my $global_known_username_string = "administrator,guest,krbtgt,domain admins,root,bin,none,admin,user,test,backup,operator,supervisor,poweruser,developer,it,helpdesk,support,sysadmin,sql,sqldba,exchange,iis,ftp,invitado,administrador,soporte,usuario,prueba";
 my @dependent_programs = qw(nmblookup net rpcclient smbclient);
@@ -142,7 +157,10 @@ Simple wrapper around the tools in the samba package to provide similar
 functionality to enum.exe (formerly from www.bindview.com).  Some additional 
 features such as RID cycling have also been added for convenience.
 
-Usage: $0 [options] ip
+Usage: $0 [options] target [target ...]
+
+Targets may be hostnames, IPv4 addresses, IPv4 CIDR ranges, or a
+comma-separated list.  Use --target-file for one target per line.
 
 Options are (like "enum"):
     -U        get userlist
@@ -176,6 +194,20 @@ Additional options:
     -n        Do an nmblookup (similar to nbtstat)
     -v        Verbose.  Shows full commands being run (net, rpcclient, etc.)
     -A        Aggressive. Do write checks on shares etc
+
+Batch and noise-control options:
+    -t n, --threads n       Maximum concurrent hosts (default: $global_concurrency)
+    -q n, --rate n          Maximum host attempts started per second (default: $global_rate)
+    -T n, --retries n       Retries after a transient host failure (default: $global_retries)
+    --retry-delay sec       Initial retry backoff in seconds (default: $global_retry_delay)
+    --host-timeout sec      Hard timeout for one host attempt (default: $global_host_timeout)
+    --time-budget sec       Whole-batch deadline (default: $global_time_budget; 0 disables)
+    --targets list          Comma/space-separated targets or IPv4 CIDRs
+    --target-file file      Read targets from a file; # starts a comment
+    --max-hosts n           Maximum expanded host count (default: $global_max_hosts)
+
+Authentication failures and account-lockout responses are never retried.
+Each host is enumerated by one worker at a time.
 
 RID cycling should extract a list of users from Windows \(or Samba\) hosts 
 which have RestrictAnonymous set to 1 \(Windows NT and 2000\), or \"Network 
@@ -212,21 +244,32 @@ $ENV{'PATH'} =~ s/:$//;
 $ENV{'PATH'} =~ s/^\.://;
 $ENV{'PATH'} =~ s/:\.//;
 
-getopts('UMNSPGlLDu:dp:f:rR:s:k:vAow:hnaiPK:', \%opts);
+Getopt::Long::Configure(qw(pass_through no_auto_abbrev no_ignore_case));
+my @long_argv = @ARGV;
+GetOptionsFromArray(
+	\@long_argv,
+	'help' => sub { print $usage; exit 0 },
+	'threads|concurrency|max-concurrency=i' => \$global_concurrency,
+	'rate|rate-limit=f'     => \$global_rate,
+	'retries|host-retries=i' => \$global_retries,
+	'retry-delay=f'         => \$global_retry_delay,
+	'host-timeout=f'        => \$global_host_timeout,
+	'time-budget=f'         => sub {
+		$global_time_budget = $_[1];
+		$global_time_budget_explicit = 1;
+	},
+	'targets|hosts=s'       => \$global_targets_option,
+	'target-file|host-file|hosts-file=s' => \$global_target_file,
+	'max-hosts=i'           => \$global_max_hosts,
+) or die $usage;
+@ARGV = @long_argv;
+
+getopts('UMNSPGlLDu:dp:f:rR:s:k:vAow:hnaiPK:t:q:T:', \%opts);
 
 # Print help message if required
 if ($opts{'h'}) {
 	print $usage;
 	exit 0;
-}
-
-# Read host and untaint
-my $global_target = shift or die $usage;
-if ($global_target =~ /^([a-zA-Z0-9\._\-]+)$/) {
-	$global_target = $1;
-} else {
-	print "ERROR: Target hostname \"$global_target\" contains some illegal characters\n";
-	exit 1;
 }
 
 #
@@ -264,10 +307,47 @@ $global_workgroup      = $opts{'w'} if $opts{'w'};
 $verbose               = $opts{'v'} if $opts{'v'};
 $aggressive            = 1          if $opts{'A'};
 $opts{'r'}             = 1          if $opts{'R'};
+$global_concurrency    = $opts{'t'} if defined($opts{'t'});
+$global_rate           = $opts{'q'} if defined($opts{'q'});
+$global_retries        = $opts{'T'} if defined($opts{'T'});
 
 $global_search_until_fail = 1 if defined($opts{'K'});
 
 my @global_known_usernames = split(",", $global_known_username_string);
+
+foreach my $number_option (
+	['threads', \$global_concurrency, 1],
+	['rate', \$global_rate, 0],
+	['retries', \$global_retries, 0],
+	['retry-delay', \$global_retry_delay, 0],
+	['host-timeout', \$global_host_timeout, 0.01],
+	['time-budget', \$global_time_budget, 0],
+	['max-hosts', \$global_max_hosts, 1],
+) {
+	my ($name, $value_ref, $minimum) = @$number_option;
+	unless (defined($$value_ref) && $$value_ref >= $minimum) {
+		print "ERROR: --$name must be a number greater than or equal to $minimum\n";
+		exit 1;
+	}
+}
+
+my @target_specs = split(/[\s,]+/, $global_targets_option);
+if ($global_target_file ne '') {
+	open my $target_fh, '<', $global_target_file
+		or die "ERROR: Can't open target file $global_target_file: $!\n";
+	while (my $line = <$target_fh>) {
+		$line =~ s/#.*//;
+		push @target_specs, split(/[\s,]+/, $line);
+	}
+	close $target_fh;
+}
+push @target_specs, @ARGV;
+@target_specs = grep { length($_) } @target_specs;
+die $usage unless @target_specs;
+
+my @global_targets = expand_targets(@target_specs);
+die "ERROR: No valid targets were supplied\n" unless @global_targets;
+$global_time_budget = 0 if @global_targets == 1 && !$global_time_budget_explicit;
 
 # Check that dependant programs are present on the system
 my $dependency_error = 0;
@@ -277,7 +357,7 @@ foreach my $prog (@dependent_programs) {
     print "Please install \"which\" for this script to work correctly\n";
     exit 1;
   }
-	my $which_output = `which $prog 2>/dev/null`;
+	$which_output = `which $prog 2>/dev/null`;
 	chomp $which_output;
 	if (($which_output !~ /^\/.*\/$prog$/) && (! -f "/usr/bin/" . $prog) && (! -f "/usr/sbin/" . $prog) && (! -f "/usr/local/bin/" . $prog) && (! -f "/usr/local/bin/" . $prog)) {
 		print "ERROR: $prog is not in your path.  Check that samba package is installed\n";
@@ -322,39 +402,337 @@ $global_username =~ s/'/'\\''/g;       ($global_username)       = $global_userna
 $global_password =~ s/'/'\\''/g;       ($global_password)       = $global_password       =~ /(.*)/;
 
 # Output message about options used
+$| = 1;
 print "Starting enum4linux v$VERSION ( http://labs.portcullis.co.uk/application/enum4linux/ ) on " .  scalar(localtime) . "\n";
-print_heading("Target Information");
-print "Target ........... $global_target\n";
-print "RID Range ........ $global_rid_range\n";
-print "Username ......... '$global_username'\n";
-print "Password ......... '$global_password'\n";
-print "Known Usernames .. " . join(", ", @global_known_usernames) . "\n";
-print "\n";
+if (@global_targets > 1) {
+	print "Batch ............ " . scalar(@global_targets) . " targets\n";
+	print "Concurrency ...... $global_concurrency\n";
+	print "Rate limit ....... $global_rate host attempts/second\n";
+	print "Retries .......... $global_retries\n";
+	print "Host timeout ..... $global_host_timeout seconds\n";
+	print "Batch budget ..... " . ($global_time_budget > 0 ? "$global_time_budget seconds" : "unlimited") . "\n";
+}
 
-# Basic enumeration, check session
-get_workgroup();
-get_nbtstat()          if $opts{'n'};
-make_session();
-get_ldapinfo()         if $opts{'l'};
-get_domain_sid();
-get_os_info()          if $opts{'o'};
+my $batch_status = run_target_batch(@global_targets);
+exit 1 if $batch_status != 0;
 
-# enum-compatible functions
-enum_users()           if $opts{'U'};
-enum_machines()        if $opts{'M'};
-enum_names()           if $opts{'N'};
-enum_shares()          if $opts{'S'};
-enum_password_policy() if $opts{'P'};
-enum_groups()          if $opts{'G'};
-enum_dom_groups()      if $opts{'G'};
-enum_lsa_policy()      if $opts{'L'};
+sub run_target {
+	print_heading("Target Information");
+	print "Target ........... $global_target\n";
+	print "RID Range ........ $global_rid_range\n";
+	print "Username ......... '$global_username'\n";
+	print "Password ......... '$global_password'\n";
+	print "Known Usernames .. " . join(", ", @global_known_usernames) . "\n";
+	print "\n";
 
-# extra stuff that runs slowly
-enum_users_rids()      if $opts{'r'};
-enum_shares_unauth()   if $opts{'s'};
-get_printer_info()     if $opts{'i'};
+	# Basic enumeration, check session
+	get_workgroup();
+	get_nbtstat()          if $opts{'n'};
+	make_session();
+	get_ldapinfo()         if $opts{'l'};
+	get_domain_sid();
+	get_os_info()          if $opts{'o'};
 
-print "enum4linux complete on " . scalar(localtime) . "\n\n";
+	# enum-compatible functions
+	enum_users()           if $opts{'U'};
+	enum_machines()        if $opts{'M'};
+	enum_names()           if $opts{'N'};
+	enum_shares()          if $opts{'S'};
+	enum_password_policy() if $opts{'P'};
+	enum_groups()          if $opts{'G'};
+	enum_dom_groups()      if $opts{'G'};
+	enum_lsa_policy()      if $opts{'L'};
+
+	# extra stuff that runs slowly
+	enum_users_rids()      if $opts{'r'};
+	enum_shares_unauth()   if $opts{'s'};
+	get_printer_info()     if $opts{'i'};
+
+	print "enum4linux complete on " . scalar(localtime) . "\n\n";
+}
+
+sub expand_targets {
+	my @specs = @_;
+	my @targets;
+	my %seen;
+
+	foreach my $spec (@specs) {
+		next if $spec eq '';
+		if ($spec =~ m{^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})$}) {
+			my ($a, $b, $c, $d, $prefix) = ($1, $2, $3, $4, $5);
+			if ($a > 255 || $b > 255 || $c > 255 || $d > 255 || $prefix > 32) {
+				print "ERROR: Invalid IPv4 CIDR target \"$spec\"\n";
+				exit 1;
+			}
+			my $base = ($a << 24) | ($b << 16) | ($c << 8) | $d;
+			my $host_bits = 32 - $prefix;
+			my $count = 1 << $host_bits;
+			$base &= (0xffffffff << $host_bits) & 0xffffffff;
+			for (my $offset = 0; $offset < $count; $offset++) {
+				next if $prefix <= 30 && ($offset == 0 || $offset == $count - 1);
+				my $ip = $base + $offset;
+				my $target = join('.', ($ip >> 24) & 255, ($ip >> 16) & 255, ($ip >> 8) & 255, $ip & 255);
+				push_target(\@targets, \%seen, $target);
+			}
+		} elsif ($spec =~ /^([a-zA-Z0-9\._\-]+)$/) {
+			push_target(\@targets, \%seen, $1);
+		} else {
+			print "ERROR: Target \"$spec\" contains some illegal characters\n";
+			exit 1;
+		}
+	}
+	return @targets;
+}
+
+sub push_target {
+	my ($targets_ref, $seen_ref, $target) = @_;
+	my $key = lc($target);
+	return if $seen_ref->{$key}++;
+	if (@$targets_ref >= $global_max_hosts) {
+		print "ERROR: Target expansion exceeds --max-hosts ($global_max_hosts)\n";
+		exit 1;
+	}
+	push @$targets_ref, $target;
+}
+
+sub run_target_batch {
+	my @targets = @_;
+	my @queue = map {
+		{
+			target => $_,
+			attempt => 1,
+			attempts_left => $global_retries + 1,
+			ready_at => 0,
+		}
+	} @targets;
+	my %active;
+	my $batch_start = Time::HiRes::time();
+	my $next_start_at = 0;
+	my $rate_interval = $global_rate > 0 ? 1 / $global_rate : 0;
+	my ($succeeded, $failed, $timed_out) = (0, 0, 0);
+
+	my $complete_job = sub {
+		my ($job, $pid, $exit_code, $was_timeout) = @_;
+		my $output = read_output_file($job->{output_file});
+		unlink $job->{output_file};
+		my $target = $job->{target};
+		my $now = Time::HiRes::time();
+		my $auth_failure = $exit_code == 2;
+		my $remaining_budget = $global_time_budget > 0
+			? $global_time_budget - ($now - $batch_start)
+			: undef;
+		my $can_retry = $job->{attempts_left} > 1
+			&& !$auth_failure
+			&& (!defined($remaining_budget) || $remaining_budget > 0);
+
+		if ($exit_code == 0 && !$was_timeout) {
+			print deduplicate_output($output);
+			$succeeded++;
+			return;
+		}
+
+		if ($auth_failure) {
+			print deduplicate_output($output);
+			print_error("Authentication failure on $target; not retrying to avoid account lockout.\n");
+			$failed++;
+			return;
+		}
+
+		if ($can_retry) {
+			my $delay = $global_retry_delay * (2 ** ($job->{attempt} - 1));
+			my $backoff = $delay + (($pid || 0) % 100) / 1000;
+			print_info("Transient failure on $target (attempt $job->{attempt}); retrying in " . sprintf("%.2f", $backoff) . "s.\n");
+			push @queue, {
+				target => $target,
+				attempt => $job->{attempt} + 1,
+				attempts_left => $job->{attempts_left} - 1,
+				ready_at => $now + $backoff,
+			};
+			return;
+		}
+
+		print deduplicate_output($output);
+		if ($was_timeout) {
+			print_error("Host $target timed out after " . sprintf("%.1f", $global_host_timeout) . "s; not retrying.\n");
+			$timed_out++;
+		} else {
+			print_error("Host $target failed after $job->{attempt} attempt(s) with exit code $exit_code.\n");
+			$failed++;
+		}
+	};
+
+	while (@queue || %active) {
+		my $now = Time::HiRes::time();
+		if ($global_time_budget > 0 && $now - $batch_start >= $global_time_budget) {
+			foreach my $pid (keys %active) {
+				my $job = delete $active{$pid};
+				terminate_process_group($pid);
+				my $output = read_output_file($job->{output_file});
+				unlink $job->{output_file};
+				print deduplicate_output($output);
+				print_error("Host $job->{target} stopped at the batch time budget.\n");
+				$timed_out++;
+			}
+			if (@queue) {
+				print_error(scalar(@queue) . " host(s) were not started before the batch time budget expired.\n");
+				$timed_out += scalar(@queue);
+				@queue = ();
+			}
+			last;
+		}
+
+		while (1) {
+			my $pid = waitpid(-1, WNOHANG);
+			last if $pid <= 0;
+			my $job = delete $active{$pid};
+			next unless defined($job);
+			my $exit_code = WIFEXITED($?) ? WEXITSTATUS($?) : 1;
+			$complete_job->($job, $pid, $exit_code, 0);
+		}
+
+		$now = Time::HiRes::time();
+		foreach my $pid (keys %active) {
+			my $job = $active{$pid};
+			next unless $now - $job->{started_at} >= $global_host_timeout;
+			delete $active{$pid};
+			terminate_process_group($pid);
+			$complete_job->($job, $pid, 124, 1);
+		}
+
+		my $launched = 0;
+		while (keys(%active) < $global_concurrency) {
+			$now = Time::HiRes::time();
+			my $queue_index;
+			for my $index (0 .. $#queue) {
+				if ($queue[$index]{ready_at} <= $now) {
+					$queue_index = $index;
+					last;
+				}
+			}
+			last unless defined($queue_index);
+
+			my $wait = $next_start_at - $now;
+			if ($wait > 0) {
+				my $sleep_for = $wait;
+				if ($global_time_budget > 0) {
+					my $remaining = $global_time_budget - ($now - $batch_start);
+					last if $remaining <= 0;
+					$sleep_for = $remaining if $remaining < $sleep_for;
+				}
+				Time::HiRes::sleep($sleep_for) if $sleep_for > 0;
+				next;
+			}
+
+			my $job = splice(@queue, $queue_index, 1);
+			my ($output_fh, $output_file) = File::Temp::tempfile(
+				'enum4linux-host-XXXXXX',
+				TMPDIR => 1,
+				UNLINK => 0,
+			);
+			close $output_fh;
+			my $pid = fork();
+			if (!defined($pid)) {
+				unlink $output_file;
+				die "ERROR: Unable to fork a host worker: $!\n";
+			}
+			if ($pid == 0) {
+				run_host_worker($job->{target}, $output_file);
+			}
+			$job->{output_file} = $output_file;
+			$job->{started_at} = Time::HiRes::time();
+			$active{$pid} = $job;
+			$next_start_at = Time::HiRes::time() + $rate_interval if $rate_interval > 0;
+			$launched = 1;
+		}
+
+		if (!%active) {
+			my $next_ready;
+			foreach my $job (@queue) {
+				$next_ready = $job->{ready_at}
+					if !defined($next_ready) || $job->{ready_at} < $next_ready;
+			}
+			$next_ready = Time::HiRes::time() if !defined($next_ready);
+			my $wait = $next_ready - Time::HiRes::time();
+			$wait = 0.01 if $wait < 0.01;
+			Time::HiRes::sleep($wait > 0.25 ? 0.25 : $wait);
+		} elsif (!$launched) {
+			Time::HiRes::sleep(0.02);
+		}
+	}
+
+	my $elapsed = Time::HiRes::time() - $batch_start;
+	print "\n[+] Batch complete: $succeeded succeeded, $failed failed, $timed_out timed out in "
+		. sprintf("%.2f", $elapsed) . "s\n\n";
+	return ($failed || $timed_out) ? 1 : 0;
+}
+
+sub run_host_worker {
+	my ($target, $output_file) = @_;
+	setpgrp(0, 0);
+	open(STDOUT, '>', $output_file) or exit 1;
+	open(STDERR, '>&', STDOUT) or exit 1;
+	select(STDOUT);
+	$| = 1;
+	$global_target = $target;
+	my $status = 0;
+	eval {
+		run_target();
+		1;
+	} or do {
+		my $error = $@ || 'unknown error';
+		print "\n[E] Host worker error: $error\n";
+		$status = 1;
+	};
+	close STDERR;
+	close STDOUT;
+	exit($status);
+}
+
+sub terminate_process_group {
+	my ($pid) = @_;
+	kill('TERM', -$pid) or kill('TERM', $pid);
+	my $deadline = Time::HiRes::time() + 0.5;
+	while (Time::HiRes::time() < $deadline) {
+		my $result = waitpid($pid, WNOHANG);
+		return if $result == $pid || $result == -1;
+		Time::HiRes::sleep(0.02);
+	}
+	kill('KILL', -$pid) or kill('KILL', $pid);
+	waitpid($pid, 0);
+}
+
+sub read_output_file {
+	my ($path) = @_;
+	open my $fh, '<', $path or return '';
+	local $/;
+	my $output = <$fh>;
+	close $fh;
+	return defined($output) ? $output : '';
+}
+
+sub deduplicate_output {
+	my ($output) = @_;
+	my %seen;
+	my @deduplicated;
+	foreach my $line (split(/^/m, $output)) {
+		my $trimmed = $line;
+		$trimmed =~ s/\s+$//;
+		$trimmed =~ s/^\s+//;
+		if ($trimmed ne '') {
+			my $key = lc($trimmed);
+			if ($trimmed =~ /^(user|group|machine):\[([^\]]+)\]/i) {
+				$key = lc("$1:$2");
+			} elsif ($trimmed =~ /^index:.*?\bAccount:\s*(\S+)/i) {
+				$key = lc("user:$1");
+			} elsif ($trimmed =~ /^(S-\d+-\d+-\d+-[\d-]+)\s+(?:[^\\]+\\)?([^\s]+)\s+\(([^)]*)\)/) {
+				$key = lc("sid:$1:$2:$3");
+			}
+			next if $seen{$key}++;
+		}
+		push @deduplicated, $line;
+	}
+	return join('', @deduplicated);
+}
 
 sub get_nbtstat {
 	print_heading("Nbtstat Information for $global_target");
@@ -449,12 +827,22 @@ sub get_ldapinfo {
 }
 
 # See if we can connect using a null session or supplied credentials
+sub output_has_auth_failure {
+	my ($output) = @_;
+	return 1 if $output =~ /NT_STATUS_(?:LOGON_FAILURE|WRONG_PASSWORD|ACCOUNT_LOCKED_OUT|ACCOUNT_DISABLED|ACCOUNT_RESTRICTION|PASSWORD_EXPIRED|PASSWORD_MUST_CHANGE|INVALID_LOGON_HOURS|INVALID_WORKSTATION|LOGON_TYPE_NOT_GRANTED|NO_SUCH_USER)/i;
+	return 1 if $output =~ /STATUS_(?:LOGON_FAILURE|WRONG_PASSWORD|ACCOUNT_LOCKED_OUT)/i;
+	return 0 if $output =~ /NT_STATUS_(?:IO_TIMEOUT|CONNECTION_RESET|CONNECTION_REFUSED|HOST_UNREACHABLE|NETWORK_UNREACHABLE|NO_LOGON_SERVERS)/i;
+	return 1 if $output =~ /session setup failed:\s*NT_STATUS_/i;
+	return 0;
+}
+
 sub make_session {
 	print_heading("Session Check on $global_target");
 	my $command = "smbclient -W '$global_workgroup' //'$global_target'/ipc\$ -U'$global_username'\%'$global_password' -c 'help' 2>&1";
 	print_verbose("Attempting to make null session using command: $command\n") if $verbose;
 	my $os_info = `$command`;
 	chomp $os_info;
+	my $auth_failure = output_has_auth_failure($os_info);
 	if ($os_info =~ /protocol negotiation failed: NT_STATUS_CONNECTION_RESET/) {
 		print_error("Protocol mismatch.  smbclient doesn\'t support the same protocol versions as the server.  You likely need to install a later version of Samba.\n");
 	}
@@ -462,7 +850,8 @@ sub make_session {
 		print_plus("Server $global_target allows sessions using username '$global_username', password '$global_password'\n");
 	} else {
 		print_error("Server doesn't allow session using username '$global_username', password '$global_password'.  Aborting remainder of tests.\n");
-		exit 1;
+		print_error("Authentication failure detected; no retry will be attempted on this host.\n") if $auth_failure;
+		exit($auth_failure ? 2 : 1);
 	}
 
 	# Use this info to set workgroup if possible

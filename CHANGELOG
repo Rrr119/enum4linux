@@ -1,3 +1,15 @@
+2026-11-21
+
+* Added batch target input from positional targets, CIDR lists, --targets,
+  and --target-file.
+* Added bounded host concurrency, host-start rate limiting, exponential
+  per-host retries, per-host timeout, and a whole-batch time budget.
+* Added authentication failure and account-lockout detection; those failures
+  are never retried.
+* Added duplicate target and result-record suppression.
+* Added mock SMB coverage for retries, lockout safety, deduplication,
+  concurrency/rate limits, and a 500-host completion budget.
+
 2021-06-28 Enum4Linux v0.9.1
 
 * Cleaned up CHANGELOG.
